@@ -158,7 +158,8 @@ class GaussianModel:
         self.octree_root.insert_all_gaussian()
 
     def dump_octree_to_file(self, filename: str):
-        
+        if not use_octree:
+            return
         """将八叉树结构输出到文本文件"""
         with open(filename, "w") as f:
             # 写入八叉树基本信息
@@ -278,7 +279,6 @@ class GaussianModel:
         # 初始化八叉树，将所有初始高斯核插入树中
         if use_octree:
             self._reset_octree()
-        self._reset_octree()
 
 
     def training_setup(self, training_args):

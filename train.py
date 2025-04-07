@@ -1,14 +1,5 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
 
+# 导入必要的库
 import os
 import torch
 from random import randint
@@ -22,80 +13,133 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+# 导入必要的库
+import torch.nn.functional as F
+from torchvision.transforms.functional import gaussian_blur
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
+
+progressive_training = False
+min_resolution_scale = 0.2
+max_resolution_scale = 1.0
+window_size = int(500)
+
+# 训练函数，负责整个训练过程的执行
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
+    # 准备输出和日志记录器
     tb_writer = prepare_output_and_logger(dataset)
+    # 初始化高斯模型
     gaussians = GaussianModel(dataset.sh_degree)
+    # 初始化场景
     scene = Scene(dataset, gaussians)
+    # 设置训练参数
     gaussians.training_setup(opt)
+    # 如果有检查点，加载模型参数
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    # 设置背景颜色
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    # 初始化CUDA事件，用于计时
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    # 初始化进度条
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+
+
+    # 添加：初始化分辨率相关变量
+    current_resolution_scale = min_resolution_scale  # 当前分辨率比例
+    # 添加：初始化损失移动平均相关变量
+    loss_history = []  # 记录损失历史
+    loss_ma_history = []
+    # window_size = window_size  # 移动平均窗口大小
+    
+    # 添加：初始化延迟计数器
+    
+    delay_after_resolution_increase = window_size * 4  # 分辨率提升后的延迟轮数
+    delay_counter = delay_after_resolution_increase
+
+    # 开始训练循环
     for iteration in range(first_iter, opt.iterations + 1):        
+        # 检查网络GUI连接
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
             try:
                 net_image_bytes = None
+                # 接收网络GUI的数据
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
+                    # 渲染图像
                     net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                # 发送渲染图像到网络GUI
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
                     break
             except Exception as e:
                 network_gui.conn = None
 
+        # 记录迭代开始时间
         iter_start.record()
 
+        # 更新学习率
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
+        # 每1000次迭代增加SH的级别
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
+        # 随机选择一个相机视角
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        # Render
+        # 渲染图像
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
+        # 设置背景
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
+
+        # 渲染图像并获取相关数据
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        # Loss
+        # 计算损失
         gt_image = viewpoint_cam.original_image.cuda()
+        # 添加：根据当前分辨率比例调整图像分辨率
+        if progressive_training and max_resolution_scale - current_resolution_scale > 0.001:
+            # 应用高斯模糊
+            # gt_image = F.gaussian_blur(gt_image, kernel_size=15, sigma=5.0)  # 调整参数增强模糊效果
+            # 计算模糊程度，current_resolution_scale 越小，模糊程度越大
+            blur_sigma = 10 * (1 - current_resolution_scale)  # 调整模糊强度
+            kernel_size = int(blur_sigma) * 2 + 1
+            gt_image = gaussian_blur(gt_image, kernel_size=kernel_size, sigma=blur_sigma)
+
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
 
+        # 记录迭代结束时间
         iter_end.record()
 
         with torch.no_grad():
-            # Progress bar
+            # 更新进度条
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
@@ -103,15 +147,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
+
+            # 添加：更新损失历史并计算移动平均
+            loss_history.append(loss.item())
+            if len(loss_history) >= window_size:
+                current_ma_loss = sum(loss_history[-window_size:]) / window_size
+                loss_ma_history.append(current_ma_loss)
+            else:
+                # 如果数据不足，计算当前所有损失值的平均值
+                current_ma_loss = sum(loss_history) / len(loss_history)
+                loss_ma_history.append(current_ma_loss)
+
+            # 添加：动态调整分辨率逻辑
+            # 倒计时-1
+            if delay_counter > 0:
+                delay_counter -= 1
+            if progressive_training and len(loss_ma_history) >= 3 * window_size and max_resolution_scale - current_resolution_scale > 0.001 and delay_counter == 0:  # 确保有足够的数据
+                delay_counter = delay_after_resolution_increase
+                
+                current_ma = loss_ma_history[-1]  # 当前100轮移动平均
+                prev_ma = loss_ma_history[-(1 + window_size)]  # 100轮前的移动平均
+                prev_prev_ma = loss_ma_history[-(1 + 2 * window_size)]  # 200轮前的移动平均
+                # 如果当前MA < 100轮前MA < 200轮前MA，认为仍需训练
+                if current_ma < prev_ma < prev_prev_ma:
+                    pass  # 继续训练
+                else:
+                    # 否则，提高分辨率
+                    
+                    current_resolution_scale = min(max_resolution_scale, current_resolution_scale + 0.4)  # 分辨率翻倍
+                    print(f"\n[ITER {iteration}] Increasing resolution to {current_resolution_scale:.2f}")  # 打印分辨率提升信息
+
+                    # 添加：保存模型
+                    print(f"[ITER {iteration}] Saving Gaussians after resolution increase")
+                    scene.save(iteration)  # 保存模型
+                    torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")  # 保存检查点
+
+            # 记录日志和保存模型
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
+            # 密度化处理
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
+                # 跟踪图像空间中的最大半径以进行剪枝
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
@@ -122,16 +201,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
-            # Optimizer step
+            # 优化器步骤
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
+            # 保存检查点
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+    # 将八叉树数据保存到文件
     gaussians.dump_octree_to_file("log")
 
+    # loss_history
+
+# 准备输出和日志记录器
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -140,13 +224,13 @@ def prepare_output_and_logger(args):
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
-    # Set up output folder
+    # 设置输出文件夹
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
+    # 创建Tensorboard记录器
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
@@ -154,13 +238,14 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
+# 训练报告函数，记录训练过程中的各项指标
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
-    # Report test and samples of training set
+    # 报告测试集和训练集的样本
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
@@ -191,8 +276,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
+# 主函数，程序入口
 if __name__ == "__main__":
-    # Set up command line argument parser
+    # 设置命令行参数解析器
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
@@ -201,8 +287,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5_000, 10_000, 15_000, 20_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[5_000, 10_000, 15_000, 20_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
@@ -211,13 +297,13 @@ if __name__ == "__main__":
     
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
+    # 初始化系统状态（随机数生成器）
     safe_state(args.quiet)
 
-    # Start GUI server, configure and run training
+    # 启动GUI服务器，配置并运行训练
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
-    # All done
+    # 训练完成
     print("\nTraining complete.")
