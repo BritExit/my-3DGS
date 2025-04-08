@@ -20,93 +20,31 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+import json
 
 
 octree_max_depth = 8
 octree_max_gaussians =10
 octree_bbox_min = [-1.0, -1.0, -1.0]
 octree_bbox_max = [1.0, 1.0, 1.0] 
-use_octree = False
+use_octree = True
 
 class GaussianModel:
     class OctreeNode:
         def __init__(self, parent, bbox_min, bbox_max, depth=0):
             self.parent = parent  # 指向父节点（GaussianModel）
-            self.bbox_min = bbox_min  # 空间范围的最小坐标
-            self.bbox_max = bbox_max  # 空间范围的最大坐标
+            self.bbox_min = torch.tensor(bbox_min, device="cuda") if not isinstance(bbox_min, torch.Tensor) else bbox_min.to("cuda")
+            self.bbox_max = torch.tensor(bbox_max, device="cuda") if not isinstance(bbox_max, torch.Tensor) else bbox_max.to("cuda")
+            # self.bbox_min = torch.tensor(bbox_min, device="cuda")  # 空间范围的最小坐标
+            # self.bbox_max = torch.tensor(bbox_max, device="cuda")  # 空间范围的最大坐标
             self.depth = depth  # 节点深度
             self.children = []  # 子节点索引
-            self.gaussian_indices = []  # 高斯核索引（仅叶子节点使用）
+            self.gaussian_indices = torch.tensor([], dtype=torch.long, device="cuda")  # 高斯核索引（仅叶子节点使用）
 
         def is_leaf(self):
             """判断当前节点是否为叶节点"""
             return len(self.children) == 0
-        def split(self):
-            """分裂当前节点，创建8个子节点"""
-            if self.depth >= octree_max_depth:
-                return False  # 达到最大深度，无法继续分裂
-            # 计算当前节点的中心点
-            mid = [(self.bbox_min[i] + self.bbox_max[i]) / 2 for i in range(3)]
-            # 创建8个子节点
-            for i in range(8):
-                child_bbox_min = [
-                    self.bbox_min[0] if (i & 1) == 0 else mid[0],
-                    self.bbox_min[1] if (i & 2) == 0 else mid[1],
-                    self.bbox_min[2] if (i & 4) == 0 else mid[2],
-                ]
-                child_bbox_max = [
-                    mid[0] if (i & 1) == 0 else self.bbox_max[0],
-                    mid[1] if (i & 2) == 0 else self.bbox_max[1],
-                    mid[2] if (i & 4) == 0 else self.bbox_max[2],
-                ]
-                self.children.append(GaussianModel.OctreeNode(self.parent, child_bbox_min, child_bbox_max, self.depth + 1))
-            # 将当前节点的高斯核重新分配到子节点中
-            for gaussian_index in self.gaussian_indices:
-                self._redistribute_gaussian_to_children(gaussian_index)
-            self.gaussian_indices = []  # 清空当前节点的高斯核
-            return True
-        def _redistribute_gaussian_to_children(self, gaussian_index):
-            """将高斯核重新分配到子节点中"""
-            xyz = self.parent.all_xyz[gaussian_index]
-            for child in self.children:
-                if self._is_point_in_bbox(xyz, child.bbox_min, child.bbox_max):
-                    child.insert_gaussian(gaussian_index)
-                    break
-        def insert_gaussian(self, gaussian_index):
-            """插入高斯核到当前节点或其子节点中"""
-            # xyz = self.parent._get_gaussian_position(gaussian_index)
-            xyz = self.parent.all_xyz[gaussian_index]
-            if not self._is_point_in_bbox(xyz, self.bbox_min, self.bbox_max):
-                return False  # 高斯核不在当前节点的空间范围内
-            if self.is_leaf():
-                if len(self.gaussian_indices) <= octree_max_gaussians:
-                    # 当前节点是叶节点且未达到高斯核数量上限，直接插入
-                    self.gaussian_indices.append(gaussian_index)
-                    return True
-                else:
-                    # 当前节点是叶节点且达到高斯核数量上限，但是达到最大深度，不分裂
-                    if self.depth >= octree_max_depth:
-                        self.gaussian_indices.append(gaussian_index)
-                        return True
-                    # 当前节点是叶节点且达到高斯核数量上限，分裂节点
-                    self.split()
-                    # 分裂后，将高斯核插入到子节点中
-                    return self.insert_gaussian(gaussian_index)
-            else:
-                # 当前节点不是叶节点，递归插入到子节点中
-                for child in self.children:
-                    if child.insert_gaussian(gaussian_index):
-                        return True
-                return False  # 未找到合适的子节点
-        
-        def insert_all_gaussian(self):
-            len = self.parent.all_xyz.shape[0]
-            for i in range(len):
-                self.insert_gaussian(i)
 
-        def _is_point_in_bbox(self, point, bbox_min, bbox_max):
-            """判断点是否在空间范围内"""
-            return all(bbox_min[i] <= point[i] <= bbox_max[i] for i in range(3))
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
@@ -145,45 +83,92 @@ class GaussianModel:
         self.octree_root = self.OctreeNode(self, octree_bbox_min, octree_bbox_max)
         self.all_xyz = None
 
-    def _get_gaussian_position(self, gaussian_index):
-        """获取高斯核的坐标"""
-        return self._xyz[gaussian_index].detach().cpu().numpy()
 
-    def _reset_octree(self):
-        ############################ 新增代码 ############################
-        # 重置
+    def reset_octree(self):
+        """重置八叉树，并根据 self.get_xyz 插入所有高斯核"""
+        if not use_octree:
+            return
+        # 重置八叉树根节点
         self.octree_root = self.OctreeNode(self, octree_bbox_min, octree_bbox_max)
-        xyz = self.get_xyz.detach().cpu().numpy()
-        self.all_xyz = xyz
-        self.octree_root.insert_all_gaussian()
+        self.all_xyz = self.get_xyz
+
+        # 使用栈来模拟递归插入
+        stack = [(self.octree_root, torch.arange(self.all_xyz.shape[0], device="cuda"))]
+        while stack:
+            node, gaussian_indices = stack.pop()
+
+            # 如果当前节点是叶节点且未达到高斯核数量上限，直接插入
+            if node.is_leaf() and len(gaussian_indices) <= octree_max_gaussians:
+                node.gaussian_indices = gaussian_indices
+                continue  # 处理完毕，直接 pop
+
+            # 如果当前节点是叶节点但达到高斯核数量上限，分裂节点
+            if node.is_leaf():
+                # 如果到达层数上限,不分裂
+                if node.depth == octree_max_depth:
+                    node.gaussian_indices = gaussian_indices
+                    continue  # 处理完毕，直接 pop
+
+                # 计算当前节点的中心点
+                mid = (node.bbox_min + node.bbox_max) / 2
+
+                # 创建8个子节点
+                for i in range(8):
+                    child_bbox_min = torch.tensor([
+                        node.bbox_min[0] if (i & 1) == 0 else mid[0],
+                        node.bbox_min[1] if (i & 2) == 0 else mid[1],
+                        node.bbox_min[2] if (i & 4) == 0 else mid[2],
+                    ], device="cuda")
+                    child_bbox_max = torch.tensor([
+                        mid[0] if (i & 1) == 0 else node.bbox_max[0],
+                        mid[1] if (i & 2) == 0 else node.bbox_max[1],
+                        mid[2] if (i & 4) == 0 else node.bbox_max[2],
+                    ], device="cuda")
+                    node.children.append(self.OctreeNode(self, child_bbox_min, child_bbox_max, node.depth + 1))
+
+                # 获取所有待插入高斯核的坐标
+                xyz = self.all_xyz[gaussian_indices]
+
+                # 使用布尔索引高效分配索引到八个子节点
+                for i, child in enumerate(node.children):
+                    # 筛选出在子节点范围内的索引
+                    mask = torch.all((child.bbox_min <= xyz) & (xyz <= child.bbox_max), dim=1)
+                    indices = gaussian_indices[mask]
+                    # 如果索引不为空，将子节点和对应的高斯核索引压入栈中
+                    if len(indices) > 0:
+                        stack.append((child, indices))
 
     def dump_octree_to_file(self, filename: str):
         if not use_octree:
             return
-        """将八叉树结构输出到文本文件"""
+        """将八叉树结构输出到 JSON 文件"""
+        def _node_to_dict(node):
+            """将八叉树节点转换为字典"""
+            node_dict = {
+                "depth": node.depth,
+                "bbox_min": node.bbox_min.tolist(),  # 将张量转换为列表
+                "bbox_max": node.bbox_max.tolist(),
+                "is_leaf": node.is_leaf(),
+            }
+            if node.is_leaf():
+                node_dict["gaussian_indices"] = node.gaussian_indices.tolist()
+            else:
+                node_dict["children"] = [_node_to_dict(child) for child in node.children]
+            return node_dict
+
+        # 构建八叉树的字典表示
+        octree_dict = {
+            "max_depth": octree_max_depth,
+            "max_gaussians_per_node": octree_max_gaussians,
+            "bbox_min": octree_bbox_min,
+            "bbox_max": octree_bbox_max,
+            "root": _node_to_dict(self.octree_root),
+        }
+
+        # 将字典写入 JSON 文件
         with open(filename, "w") as f:
-            # 写入八叉树基本信息
-            f.write(f"Octree Structure (max_depth={octree_max_depth}, max_gaussians_per_node={octree_max_gaussians})\n")
-            f.write(f"Bounding Box: [{octree_bbox_min}, {octree_bbox_max}]\n")
-            f.write("-" * 50 + "\n")
-            
-            # 递归遍历八叉树并写入节点信息
-            def _dump_node(node, indent=0):
-                # 写入当前节点信息
-                f.write(" " * indent + f"Node [Depth {node.depth}]:\n")
-                f.write(" " * indent + f"  Bounding Box: [{node.bbox_min}, {node.bbox_max}]\n")
-                if node.is_leaf():
-                    f.write(" " * indent + f"  Leaf Node: {len(node.gaussian_indices)} Gaussians\n")
-                    f.write(" " * indent + f"  Gaussian Indices: {node.gaussian_indices}\n")
-                else:
-                    f.write(" " * indent + f"  Internal Node ({len(node.children)} children)\n")
-                
-                # 递归处理子节点
-                for child in node.children:
-                    _dump_node(child, indent + 2)
-            # 从根节点开始遍历
-            _dump_node(self.octree_root)
-            f.write("\nOctree dumped successfully.\n")
+            json.dump(octree_dict, f, indent=2)  # indent 用于格式化输出，方便阅读
+
 
 
     def capture(self):
@@ -277,8 +262,7 @@ class GaussianModel:
 
         ############################ 新增代码 ############################
         # 初始化八叉树，将所有初始高斯核插入树中
-        if use_octree:
-            self._reset_octree()
+        self.reset_octree()
 
 
     def training_setup(self, training_args):
@@ -441,8 +425,8 @@ class GaussianModel:
 
         ############################ 新增代码 ############################
         # 重置八叉树
-        if use_octree:
-            self._reset_octree()
+        # if use_octree:
+        #     self._reset_octree()
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -489,8 +473,8 @@ class GaussianModel:
 
         ############################ 新增代码 ############################
         # 重置八叉树
-        if use_octree: 
-            self._reset_octree()
+        # if use_octree: 
+        #     self._reset_octree()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]

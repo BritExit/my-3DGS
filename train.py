@@ -16,6 +16,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 # 导入必要的库
 import torch.nn.functional as F
 from torchvision.transforms.functional import gaussian_blur
+import numpy as np
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -23,11 +24,68 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+# 导入绘图库
+import matplotlib.pyplot as plt
+# 函数：绘制损失历史图像并保存
+# 函数：绘制损失历史和移动平均损失图像并保存
+# def plot_and_save_loss_history(loss_history, loss_ma_history, model_path, filename="loss_history.png"):
+#     plt.figure(figsize=(10, 6))
+#     plt.plot(loss_history, label="Loss History", color="blue", alpha=0.7)
+#     plt.plot(loss_ma_history, label="Loss Moving Average", color="red", linestyle="--", alpha=0.7)
+#     plt.xlabel("Iteration")
+#     plt.ylabel("Loss")
+#     plt.title("Training Loss History and Moving Average")
+#     plt.legend()
+#     plt.grid(True)
+#     # 保存图像到模型路径
+#     save_path = os.path.join(model_path, filename)
+#     plt.savefig(save_path)
+#     plt.close()
+#     print(f"Loss history plot saved to {save_path}")
+
+# 函数：绘制损失历史、移动平均损失和标准差图像并保存
+def plot_and_save_loss_history(loss_history, loss_ma_history, loss_std_history, model_path, filename="loss_history.png"):
+    plt.figure(figsize=(10, 6))
+    plt.plot(loss_history, label="Loss History", color="blue", alpha=0.7)
+    plt.plot(loss_ma_history, label="Loss Moving Average", color="red", linestyle="--", alpha=0.7)
+    
+    # 绘制标准差曲线
+    plt.plot(loss_std_history, label="Loss Standard Deviation", color="green", linestyle=":", alpha=0.7)
+    
+    # 获取MA和STD数组最末尾的值
+    final_ma = loss_ma_history[-1]
+    final_std = loss_std_history[-1]
+    
+    # 在图像上添加MA和STD最末尾的值
+    plt.text(0.95, 0.95, f"Final MA: {final_ma:.5f}\nFinal STD: {final_std:.5f}", 
+             transform=plt.gca().transAxes, fontsize=12, verticalalignment='top', horizontalalignment='right',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss")
+    plt.title("Training Loss History, Moving Average, and Standard Deviation")
+    plt.legend()
+    plt.grid(True)
+    
+    # 保存图像到模型路径
+    save_path = os.path.join(model_path, filename)
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Loss history plot saved to {save_path}")
 
 progressive_training = False
 min_resolution_scale = 0.2
 max_resolution_scale = 1.0
-window_size = int(500)
+window_size = int(100)
+
+def save_history(history, name, file_path):
+    with open(file_path, 'a') as f:  # 以追加模式打开文件
+        f.write(name + ":\n")
+        for loss in history:
+            f.write(f"{loss}\n")
+
+def already_convergence():
+    pass
 
 # 训练函数，负责整个训练过程的执行
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -65,11 +123,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # 添加：初始化损失移动平均相关变量
     loss_history = []  # 记录损失历史
     loss_ma_history = []
+    loss_min_history = []
+    loss_std_history = []  # 新增：记录损失标准差
     # window_size = window_size  # 移动平均窗口大小
     
     # 添加：初始化延迟计数器
     
-    delay_after_resolution_increase = window_size * 4  # 分辨率提升后的延迟轮数
+    delay_after_resolution_increase = window_size * 2  # 分辨率提升后的延迟轮数
     delay_counter = delay_after_resolution_increase
 
     # 开始训练循环
@@ -151,29 +211,45 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # 添加：更新损失历史并计算移动平均
             loss_history.append(loss.item())
             if len(loss_history) >= window_size:
-                current_ma_loss = sum(loss_history[-window_size:]) / window_size
+                window_losses = loss_history[-window_size:]
+                current_ma_loss = np.mean(window_losses)
+                current_std_loss = np.std(window_losses)  # 新增：计算标准差
                 loss_ma_history.append(current_ma_loss)
+                loss_std_history.append(current_std_loss)  # 新增：记录标准差
             else:
-                # 如果数据不足，计算当前所有损失值的平均值
-                current_ma_loss = sum(loss_history) / len(loss_history)
+                # 如果数据不足，计算当前所有损失值的平均值和标准差
+                current_ma_loss = np.mean(loss_history)
+                current_std_loss = np.std(loss_history)  # 新增：计算标准差
                 loss_ma_history.append(current_ma_loss)
+                loss_std_history.append(current_std_loss)  # 新增：记录标准差
+
+            # 计算最小损失历史
+            if len(loss_min_history) > 0:
+                loss_min_history.append(min(loss_min_history[-1], loss_history[-1]))
+            else:
+                loss_min_history.append(loss_history[-1])
 
             # 添加：动态调整分辨率逻辑
             # 倒计时-1
             if delay_counter > 0:
                 delay_counter -= 1
-            if progressive_training and len(loss_ma_history) >= 3 * window_size and max_resolution_scale - current_resolution_scale > 0.001 and delay_counter == 0:  # 确保有足够的数据
+            if progressive_training and len(loss_ma_history) >= 2 * window_size and max_resolution_scale - current_resolution_scale > 0.001 and delay_counter == 0:  # 确保有足够的数据
                 delay_counter = delay_after_resolution_increase
                 
-                current_ma = loss_ma_history[-1]  # 当前100轮移动平均
-                prev_ma = loss_ma_history[-(1 + window_size)]  # 100轮前的移动平均
-                prev_prev_ma = loss_ma_history[-(1 + 2 * window_size)]  # 200轮前的移动平均
+                # current_ma = loss_ma_history[-1]  # 当前100轮移动平均
+                # prev_ma = loss_ma_history[-(1 + window_size)]  # 100轮前的移动平均
+                # prev_prev_ma = loss_ma_history[-(1 + 2 * window_size)]  # 200轮前的移动平均
+                current_min_ma = loss_min_history[-1]
+                prev_min_ma = loss_min_history[-(1 + window_size)]
+
                 # 如果当前MA < 100轮前MA < 200轮前MA，认为仍需训练
-                if current_ma < prev_ma < prev_prev_ma:
+                # if current_ma < prev_ma < prev_prev_ma:
+                if prev_min_ma - current_min_ma > 0.0001:
                     pass  # 继续训练
                 else:
                     # 否则，提高分辨率
-                    
+                    loss_min_history[-1] = float('inf')
+
                     current_resolution_scale = min(max_resolution_scale, current_resolution_scale + 0.4)  # 分辨率翻倍
                     print(f"\n[ITER {iteration}] Increasing resolution to {current_resolution_scale:.2f}")  # 打印分辨率提升信息
 
@@ -197,6 +273,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    gaussians.reset_octree()
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -211,9 +288,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
     # 将八叉树数据保存到文件
-    gaussians.dump_octree_to_file("log")
+    gaussians.dump_octree_to_file("octree.json")
 
     # loss_history
+    save_history(loss_history, "loss_history", "loss_log")
+    save_history(loss_ma_history, "loss_ma_history", "loss_log")
+    save_history(loss_min_history, "loss_min_history", "loss_log")
+    save_history(loss_std_history, "loss_std_history", "loss_log")
+
+        # 新增：绘制损失历史图像并保存
+    # plot_and_save_loss_history(loss_history, loss_ma_history, scene.model_path)  # 新增
+    plot_and_save_loss_history(loss_history, loss_ma_history, loss_std_history, scene.model_path)  # 新增
+    
 
 # 准备输出和日志记录器
 def prepare_output_and_logger(args):    
@@ -287,8 +373,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5_000, 10_000, 15_000, 20_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[5_000, 10_000, 15_000, 20_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 5_000, 10_000, 20_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[2_500, 5_000, 10_000, 20_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
