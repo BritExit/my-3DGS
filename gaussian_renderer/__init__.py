@@ -16,7 +16,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from skimage.draw import polygon
 
-render_cube = True
+render_cube = False
 # 定义立方体的最小和最大顶点坐标（超参数）
 minxyz = torch.tensor([-0.1, -0.1, -0.1], device="cuda")  # 最小顶点
 maxxyz = torch.tensor([0.1, 0.1, 0.1], device="cuda")      # 最大顶点
@@ -153,12 +153,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # 将当前面的掩码合并到立方体掩码中
             cube_mask = torch.max(cube_mask, face_mask)
 
-        if torch.all(cube_mask == 0):
-            print("警告: cube_mask 全为 0，立方体区域未正确投影或未覆盖任何像素。")
-        else:
-            # 统计 cube_mask 中非零元素的数量
-            non_zero_count = torch.sum(cube_mask != 0).item()
-            print(f"cube_mask 中有 {non_zero_count} 个非零像素。")
+        # if torch.all(cube_mask == 0):
+        #     print("警告: cube_mask 全为 0，立方体区域未正确投影或未覆盖任何像素。")
+        # else:
+        #     # 统计 cube_mask 中非零元素的数量
+        #     non_zero_count = torch.sum(cube_mask != 0).item()
+        #     print(f"cube_mask 中有 {non_zero_count} 个非零像素。")
         # 在立方体区域内应用红色滤镜
         red_filter = torch.tensor([1.0, 0.0, 0.0], device="cuda")  # 红色滤镜
         alpha = 0.5  # 透明度

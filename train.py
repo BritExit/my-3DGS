@@ -26,22 +26,6 @@ except ImportError:
 
 # 导入绘图库
 import matplotlib.pyplot as plt
-# 函数：绘制损失历史图像并保存
-# 函数：绘制损失历史和移动平均损失图像并保存
-# def plot_and_save_loss_history(loss_history, loss_ma_history, model_path, filename="loss_history.png"):
-#     plt.figure(figsize=(10, 6))
-#     plt.plot(loss_history, label="Loss History", color="blue", alpha=0.7)
-#     plt.plot(loss_ma_history, label="Loss Moving Average", color="red", linestyle="--", alpha=0.7)
-#     plt.xlabel("Iteration")
-#     plt.ylabel("Loss")
-#     plt.title("Training Loss History and Moving Average")
-#     plt.legend()
-#     plt.grid(True)
-#     # 保存图像到模型路径
-#     save_path = os.path.join(model_path, filename)
-#     plt.savefig(save_path)
-#     plt.close()
-#     print(f"Loss history plot saved to {save_path}")
 
 # 函数：绘制损失历史、移动平均损失和标准差图像并保存
 def plot_and_save_loss_history(loss_history, loss_ma_history, loss_std_history, model_path, filename="loss_history.png"):
@@ -76,7 +60,7 @@ def plot_and_save_loss_history(loss_history, loss_ma_history, loss_std_history, 
 progressive_training = False
 min_resolution_scale = 0.2
 max_resolution_scale = 1.0
-window_size = int(100)
+window_size = int(50)
 
 def save_history(history, name, file_path):
     with open(file_path, 'a') as f:  # 以追加模式打开文件
@@ -374,7 +358,7 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 5_000, 10_000, 20_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[2_500, 5_000, 10_000, 20_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 5_000, 10_000, 20_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

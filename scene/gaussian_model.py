@@ -27,7 +27,7 @@ octree_max_depth = 8
 octree_max_gaussians =10
 octree_bbox_min = [-1.0, -1.0, -1.0]
 octree_bbox_max = [1.0, 1.0, 1.0] 
-use_octree = True
+use_octree = False
 
 class GaussianModel:
     class OctreeNode:
