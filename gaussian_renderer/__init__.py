@@ -29,6 +29,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    # 创建零张量，用于让PyTorch返回2D（屏幕空间）均值的梯度
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
@@ -36,6 +37,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         pass
 
     # Set up rasterization configuration
+    # 设置光栅化配置
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
@@ -62,6 +64,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
+    # 如果提供了预计算的3D协方差，则使用它。否则，将由光栅化器根据缩放/旋转计算。
     scales = None
     rotations = None
     cov3D_precomp = None
@@ -73,6 +76,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    # 如果提供了预计算的颜色，则使用它们。否则，如果需要在Python中从SH预计算颜色，则执行。否则，SH -> RGB转换将由光栅化器完成。
     shs = None
     colors_precomp = None
     if override_color is None:
@@ -88,6 +92,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # 将可见的高斯分布光栅化为图像，获取它们的半径（在屏幕上）
     rendered_image, radii = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -174,8 +179,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # rendered_image[:] = alpha * red_filter + (1 - alpha) * rendered_image[:]
 
     # print(rendered_image.shape)
+
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # 那些被视锥剔除或半径为0的高斯分布不可见。
     # They will be excluded from value updates used in the splitting criteria.
+    # 它们将被排除在用于分割标准的更新值之外。
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,

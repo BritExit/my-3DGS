@@ -71,6 +71,11 @@ def save_history(history, name, file_path):
 def already_convergence():
     pass
 
+def print_memory_stats(prefix=""):
+    print(f"{prefix} Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB | "
+          f"Reserved: {torch.cuda.memory_reserved()/1e9:.2f}GB | "
+          f"Max Allocated: {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+
 # 训练函数，负责整个训练过程的执行
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
@@ -248,7 +253,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # 密度化处理
+            # 密度化处理 -----------------------------------
             if iteration < opt.densify_until_iter:
                 # 跟踪图像空间中的最大半径以进行剪枝
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -256,11 +261,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+
+                    # 添加合并环节
+                    # gaussians.merge_high_density_leaf()
+                    # gaussians.add_random_gaussian(20)
+                    if iteration % (opt.densification_interval * 3) == 0:
+                        gaussians.merge_high_density()
+
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
                     gaussians.reset_octree()
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            # 密度化处理 -----------------------------------
 
             # 优化器步骤
             if iteration < opt.iterations:
@@ -283,6 +297,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # 新增：绘制损失历史图像并保存
     # plot_and_save_loss_history(loss_history, loss_ma_history, scene.model_path)  # 新增
     plot_and_save_loss_history(loss_history, loss_ma_history, loss_std_history, scene.model_path)  # 新增
+
+    print("conbine times = ", gaussians.conbine_cnt)
     
 
 # 准备输出和日志记录器
